@@ -1,0 +1,18 @@
+# Secrets — NEVER push these
+.env
+tokens/
+client_secret*.json
+accounts.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
