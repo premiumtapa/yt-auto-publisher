@@ -318,6 +318,36 @@ def get_youtube_service(nickname: str, client_secret_file: str = "client_secret.
     return build("youtube", "v3", credentials=creds)
 
 
+def is_authorized(nickname: str) -> bool:
+    """
+    Return True if this account currently has valid (or refreshable) credentials.
+    - On Render: True if in-memory cache is valid OR the env var token is present and not expired.
+    - Locally: True if the token file exists.
+    This is a lightweight check — it does NOT make a network call.
+    """
+    # In-memory live creds (set after successful re-auth) take priority
+    if nickname in _live_creds:
+        creds = _live_creds[nickname]
+        if creds.valid or (creds.expired and creds.refresh_token):
+            return True
+
+    if _is_render():
+        env_key = f"YT_TOKEN_{nickname.upper()}"
+        token_json = os.getenv(env_key)
+        if not token_json:
+            return False
+        try:
+            data = json.loads(token_json)
+            # If there's a refresh_token it can stay alive
+            return bool(data.get("refresh_token") or data.get("token"))
+        except Exception:
+            return False
+    else:
+        accounts = _load_accounts()
+        token_file = accounts.get(nickname, {}).get("token_file", "")
+        return os.path.exists(token_file)
+
+
 def migrate_existing_token():
     """
     Migrate the old single-account token.json to the new multi-account system.

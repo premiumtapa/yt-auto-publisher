@@ -65,6 +65,14 @@ def format_error(e: Exception) -> str:
     return f"`{err_str[:300]}`"
 
 
+def md_escape(text: str) -> str:
+    """Escape special Markdown v1 characters in user/AI-generated text so Telegram doesn't choke."""
+    # In Markdown v1 these chars need escaping when used outside of intended formatting:
+    for ch in ["_", "*", "`", "["]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 # ──────────────────────────────────────────────
 # Main Menu
 # ──────────────────────────────────────────────
@@ -283,10 +291,10 @@ async def _publish_account(query, nickname: str):
                 await query.message.reply_text(
                     f"✅ *Video Published!*\n\n"
                     f"🔗 *URL:* {video_url}\n\n"
-                    f"📝 *Original:*\n`{original_title}`\n\n"
-                    f"🚀 *New Title:*\n`{new_title}`\n\n"
-                    f"📄 *Description:*\n{desc_preview}\n\n"
-                    f"🏷️ *Tags:*\n{tags_str}\n\n"
+                    f"📝 *Original:*\n`{md_escape(original_title)}`\n\n"
+                    f"🚀 *New Title:*\n`{md_escape(new_title)}`\n\n"
+                    f"📄 *Description:*\n{md_escape(desc_preview)}\n\n"
+                    f"🏷️ *Tags:*\n{md_escape(tags_str)}\n\n"
                     f"{trend_note}",
                     parse_mode="Markdown",
                 )
@@ -295,7 +303,7 @@ async def _publish_account(query, nickname: str):
             except Exception as e:
                 logger.error(f"Error processing video {video_id}: {e}", exc_info=True)
                 await query.message.reply_text(
-                    f"❌ *Error processing:* `{original_title}`\n"
+                    f"❌ *Error processing:* `{md_escape(original_title)}`\n"
                     f"{format_error(e)}",
                     parse_mode="Markdown",
                 )
@@ -372,7 +380,7 @@ async def _publish_all(query):
                         if trending else "⚠️ No trends"
                     )
                     await query.message.reply_text(
-                        f"✅ *Published on {label}:*\n`{optimized['title']}`\n🔗 {video_url}\n{trend_note}",
+                        f"✅ *Published on {md_escape(label)}:*\n`{md_escape(optimized['title'])}`\n🔗 {video_url}\n{trend_note}",
                         parse_mode="Markdown",
                     )
                     total_published += 1
@@ -486,41 +494,54 @@ async def _status_account(query, nickname: str):
 # ──────────────────────────────────────────────
 
 async def _show_accounts_menu(query):
-    """Show accounts list with add/remove/reauth options."""
+    """Show accounts list with auth status badges and re-auth buttons where needed."""
     accounts = account_manager.list_accounts()
     is_render = bool(os.getenv("RENDER"))
     render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
     if not accounts:
-        text = "\U0001f464 *Manage Accounts*\n\nNo accounts connected yet."
+        text = "👤 *Manage Accounts*\n\nNo accounts connected yet."
     else:
-        text = "\U0001f464 *Manage Accounts*\n\n"
+        text = "👤 *Manage Accounts*\n\n"
         for nickname, info in accounts.items():
             label = info.get("label", nickname)
             channel = info.get("channel_name", "Unknown")
-            text += f"\U0001f4fa *{label}* ({channel})\n"
+            authorized = account_manager.is_authorized(nickname)
+            badge = "✅" if authorized else "⚠️"
+            status = "Authorized" if authorized else "Needs Re-auth"
+            text += f"{badge} *{md_escape(label)}* — _{status}_\n"
+
+        if is_render:
+            text += "\n_Tap 🔁 Re-auth on any ⚠️ channel to re-authorize it._"
 
     buttons = []
     for nickname, info in accounts.items():
         label = info.get("label", nickname)
+        authorized = account_manager.is_authorized(nickname)
         row = []
         if not is_render:
-            row.append(InlineKeyboardButton(f"\u274c Remove {label}", callback_data=f"remove_{nickname}"))
-        row.append(InlineKeyboardButton(f"\U0001f501 Re-auth {label}", callback_data=f"reauth_{nickname}"))
-        buttons.append(row)
+            row.append(InlineKeyboardButton(f"❌ Remove {label}", callback_data=f"remove_{nickname}"))
+        if not authorized:
+            # Only show Re-auth for accounts that actually need it
+            row.append(InlineKeyboardButton(f"🔁 Re-auth {label}", callback_data=f"reauth_{nickname}"))
+        else:
+            # Show a "Re-auth anyway" option as a secondary button if on Render
+            if is_render:
+                row.append(InlineKeyboardButton(f"🔄 Refresh {label}", callback_data=f"reauth_{nickname}"))
+        if row:
+            buttons.append(row)
 
     if not is_render:
-        buttons.append([InlineKeyboardButton("\u2795 Add Account", callback_data="add_account")])
-    elif not accounts:
-        text += "\n_\u2601\ufe0f Running on cloud. Use 🔁 Re-auth to re-authorize existing accounts._"
+        buttons.append([InlineKeyboardButton("➕ Add Account", callback_data="add_account")])
 
-    buttons.append([InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="menu_main")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="menu_main")])
 
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
 
 
 async def _send_reauth_link(query, nickname: str):
