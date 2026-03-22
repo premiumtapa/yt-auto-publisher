@@ -188,15 +188,30 @@ def get_youtube_service(nickname: str, client_secret_file: str = "client_secret.
                 creds.refresh(Request())
             except Exception as e:
                 logger.error(f"Failed to refresh token for {nickname}: {e}")
+                if _is_render():
+                    raise RuntimeError(
+                        f"invalid_grant: Token for '{nickname}' has expired or been revoked. "
+                        f"Please re-authorize the account locally, then update the "
+                        f"YT_TOKEN_{nickname.upper()} environment variable on Render."
+                    ) from e
                 raise RuntimeError(
                     f"Token for '{nickname}' has expired or been revoked. "
-                    f"Please go to Accounts -> Remove Account and re-add it."
+                    f"Please go to Manage Accounts → Remove Account and re-add it."
                 ) from e
+
             # Save refreshed token back to file (only in local mode)
             if not _is_render():
                 token_file = accounts[nickname]["token_file"]
                 with open(token_file, "w") as tf:
                     tf.write(creds.to_json())
+            else:
+                # On Render, tokens are env vars — log the new token so it can be updated
+                new_token_json = creds.to_json()
+                logger.warning(
+                    f"[RENDER] Token for '{nickname}' was refreshed in-memory. "
+                    f"If the service restarts, it will need re-auth. "
+                    f"New token (update YT_TOKEN_{nickname.upper()} on Render): {new_token_json}"
+                )
         else:
             raise RuntimeError(
                 f"Token for '{nickname}' is invalid and can't be refreshed. "
