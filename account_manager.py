@@ -320,12 +320,15 @@ def get_youtube_service(nickname: str, client_secret_file: str = "client_secret.
 
 def is_authorized(nickname: str) -> bool:
     """
-    Return True if this account currently has valid (or refreshable) credentials.
-    - On Render: True if in-memory cache is valid OR the env var token is present and not expired.
-    - Locally: True if the token file exists.
-    This is a lightweight check — it does NOT make a network call.
+    Return True only if this account has live credentials that match the CURRENT OAuth client.
+
+    Logic:
+    1. If in _live_creds (set after a successful in-bot re-auth), it's definitely valid.
+    2. On Render: env var token must exist AND its client_id must match the current CLIENT_SECRET_JSON.
+       This catches old Desktop-client tokens that are revoked/mismatched.
+    3. Locally: token file must exist.
     """
-    # In-memory live creds (set after successful re-auth) take priority
+    # 1. In-memory live creds — set only after a successful re-auth with the CURRENT client
     if nickname in _live_creds:
         creds = _live_creds[nickname]
         if creds.valid or (creds.expired and creds.refresh_token):
@@ -337,15 +340,35 @@ def is_authorized(nickname: str) -> bool:
         if not token_json:
             return False
         try:
-            data = json.loads(token_json)
-            # If there's a refresh_token it can stay alive
-            return bool(data.get("refresh_token") or data.get("token"))
+            token_data = json.loads(token_json)
         except Exception:
             return False
+
+        # Must have a refresh_token at minimum
+        if not token_data.get("refresh_token"):
+            return False
+
+        # Validate client_id matches the CURRENT client secret
+        secret_json = os.getenv("CLIENT_SECRET_JSON", "")
+        if secret_json:
+            try:
+                secret = json.loads(secret_json)
+                # client_secret.json has {"web": {...}} or {"installed": {...}}
+                app = secret.get("web") or secret.get("installed") or {}
+                current_client_id = app.get("client_id", "")
+                token_client_id = token_data.get("client_id", "")
+                if current_client_id and token_client_id and token_client_id != current_client_id:
+                    # Token belongs to a different OAuth app — needs re-auth
+                    return False
+            except Exception:
+                pass  # Can't parse secret — fall back to just checking refresh_token exists
+
+        return True
     else:
         accounts = _load_accounts()
         token_file = accounts.get(nickname, {}).get("token_file", "")
         return os.path.exists(token_file)
+
 
 
 def migrate_existing_token():
