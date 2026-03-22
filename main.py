@@ -7,7 +7,11 @@ and starts the Telegram bot.
 
 Supports two modes:
   - LOCAL (default): Polling mode, reads tokens from files
-  - RENDER (env RENDER=true): Webhook mode, reads tokens from env vars
+  - RENDER (env RENDER=true): Single aiohttp server on PORT handling:
+      POST /webhook       — Telegram updates
+      GET  /oauth/callback — Google OAuth2 code exchange
+      GET  /oauth/start/<nick> — Redirect user to Google consent screen
+      GET  /             — Health check for UptimeRobot
 
 Usage:
     Local:  python main.py
@@ -26,7 +30,8 @@ from dotenv import load_dotenv
 import gemini_ai
 import telegram_bot
 import account_manager
-import health_check
+import oauth_server
+import token_monitor
 
 # ──────────────────────────────────────────────
 # Logging setup
@@ -42,6 +47,7 @@ logger = logging.getLogger("main")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 
 def _setup_client_secret_on_render():
@@ -111,7 +117,7 @@ async def run_bot():
     # ──────────────────────────────────────────
     logger.info("=" * 50)
     logger.info("  YouTube Auto-Publisher Bot Starting...")
-    logger.info(f"  Mode: {'RENDER (webhook)' if is_render else 'LOCAL (polling)'}")
+    logger.info(f"  Mode: {'RENDER (aiohttp webhook)' if is_render else 'LOCAL (polling)'}")
     logger.info("=" * 50)
 
     # 1. Configure Gemini AI
@@ -140,7 +146,7 @@ async def run_bot():
     # Start the bot
     # ──────────────────────────────────────────
     if is_render:
-        await _run_webhook(app, telegram_token)
+        await _run_render(app, telegram_token, authorized_ids, client_secret_file)
     else:
         await _run_polling(app)
 
@@ -180,10 +186,15 @@ async def _run_polling(app):
             await app.stop()
 
 
-async def _run_webhook(app, telegram_token):
-    """Run bot in webhook mode (Render deployment)."""
+async def _run_render(app, telegram_token: str, authorized_ids: set, client_secret_file: str):
+    """
+    Run bot in Render mode with a single aiohttp server.
+    Handles Telegram webhook, OAuth callback, and health check all on PORT.
+    """
+    from aiohttp import web
+
     port = int(os.getenv("PORT", "10000"))
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
     if not render_url:
         logger.error("RENDER_EXTERNAL_URL not set! Cannot configure webhook.")
@@ -191,24 +202,50 @@ async def _run_webhook(app, telegram_token):
 
     webhook_url = f"{render_url}/webhook"
 
+    # Configure oauth_server with references to the PTB app and settings
+    oauth_server.configure(
+        ptb_app=app,
+        authorized_user_ids=authorized_ids,
+        render_url=render_url,
+        client_secret_file=client_secret_file,
+    )
+
     logger.info("=" * 50)
-    logger.info(f"  Webhook mode on port {port}")
+    logger.info(f"  aiohttp server on port {port}")
     logger.info(f"  Webhook URL: {webhook_url}")
+    logger.info(f"  OAuth callback: {render_url}/oauth/callback")
     logger.info(f"  Health check: {render_url}/")
     logger.info("=" * 50)
 
-    # python-telegram-bot's built-in webhook server
+    # Initialize the PTB application (sets up bot, handlers, etc.)
     async with app:
         await app.start()
-        await app.updater.start_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="webhook",
-            webhook_url=webhook_url,
+
+        # Register webhook with Telegram
+        await app.bot.set_webhook(
+            url=webhook_url,
             drop_pending_updates=True,
         )
+        logger.info(f"Telegram webhook registered at {webhook_url}")
 
-        logger.info("Bot is running in webhook mode!")
+        # Build and start aiohttp server
+        web_app = oauth_server.create_web_app()
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+        logger.info(f"aiohttp server listening on 0.0.0.0:{port}")
+
+        # Start token monitor background task
+        monitor_task = asyncio.create_task(
+            token_monitor.start_monitor(
+                bot=app.bot,
+                user_ids=authorized_ids,
+                render_url=render_url,
+            )
+        )
+
+        logger.info("Bot is running in Render mode!")
 
         # Keep running until terminated
         stop_event = asyncio.Event()
@@ -228,8 +265,9 @@ async def _run_webhook(app, telegram_token):
         except KeyboardInterrupt:
             pass
         finally:
-            logger.info("Shutting down webhook...")
-            await app.updater.stop()
+            logger.info("Shutting down...")
+            monitor_task.cancel()
+            await runner.cleanup()
             await app.stop()
 
 

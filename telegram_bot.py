@@ -56,7 +56,10 @@ def format_error(e: Exception) -> str:
     """Format an exception into a user-friendly string."""
     err_str = str(e)
     if "invalid_grant" in err_str or "Token has been expired or revoked" in err_str:
-        return "⚠️ *Token Expired/Revoked*\nPlease go to 👤 Manage Accounts -> \U0001f5d1\ufe0f Remove Account and re-add it."
+        return (
+            "⚠️ *Token Expired/Revoked*\n"
+            "Tap 🔁 *Re-auth* next to this account in 👤 Manage Accounts to fix it."
+        )
     if "quotaExceeded" in err_str:
         return "⚠️ *YouTube API Quota Exceeded*\nYou must wait until midnight Pacific Time to publish more."
     return f"`{err_str[:300]}`"
@@ -131,6 +134,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("status_"):
         nickname = data.replace("status_", "")
         await _status_account(query, nickname)
+
+    # Re-auth actions
+    elif data.startswith("reauth_"):
+        nickname = data.replace("reauth_", "")
+        await _send_reauth_link(query, nickname)
 
     # Account management actions
     elif data.startswith("remove_"):
@@ -478,9 +486,10 @@ async def _status_account(query, nickname: str):
 # ──────────────────────────────────────────────
 
 async def _show_accounts_menu(query):
-    """Show accounts list with add/remove options."""
+    """Show accounts list with add/remove/reauth options."""
     accounts = account_manager.list_accounts()
     is_render = bool(os.getenv("RENDER"))
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
     if not accounts:
         text = "\U0001f464 *Manage Accounts*\n\nNo accounts connected yet."
@@ -491,23 +500,60 @@ async def _show_accounts_menu(query):
             channel = info.get("channel_name", "Unknown")
             text += f"\U0001f4fa *{label}* ({channel})\n"
 
-    if is_render:
-        text += "\n_\u2601\ufe0f Running on cloud. Account management is only available when running locally._"
-
     buttons = []
+    for nickname, info in accounts.items():
+        label = info.get("label", nickname)
+        row = []
+        if not is_render:
+            row.append(InlineKeyboardButton(f"\u274c Remove {label}", callback_data=f"remove_{nickname}"))
+        row.append(InlineKeyboardButton(f"\U0001f501 Re-auth {label}", callback_data=f"reauth_{nickname}"))
+        buttons.append(row)
+
     if not is_render:
-        for nickname, info in accounts.items():
-            label = info.get("label", nickname)
-            buttons.append([
-                InlineKeyboardButton(f"\u274c Remove {label}", callback_data=f"remove_{nickname}")
-            ])
         buttons.append([InlineKeyboardButton("\u2795 Add Account", callback_data="add_account")])
+    elif not accounts:
+        text += "\n_\u2601\ufe0f Running on cloud. Use 🔁 Re-auth to re-authorize existing accounts._"
+
     buttons.append([InlineKeyboardButton("\u2b05\ufe0f Back", callback_data="menu_main")])
 
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _send_reauth_link(query, nickname: str):
+    """Generate OAuth URL and send it to the user as a clickable link."""
+    import oauth_server
+    accounts = account_manager.list_accounts()
+    label = accounts.get(nickname, {}).get("label", nickname)
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+    if not render_url:
+        # Local mode: show instructions
+        await query.edit_message_text(
+            f"🔁 *Re-auth {label}*\n\n"
+            "In local mode, remove the account and re-add it to trigger OAuth.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Back", callback_data="menu_accounts")],
+            ]),
+        )
+        return
+
+    reauth_url = f"{render_url}/oauth/start/{nickname}"
+
+    await query.edit_message_text(
+        f"🔁 *Re-authorize {label}*\n\n"
+        f"Tap the link below to sign in with Google and re-authorize this channel.\n\n"
+        f"After you approve access, return here — the bot will confirm automatically.\n\n"
+        f"🔗 [Tap here to re-authorize]({reauth_url})",
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="menu_accounts")],
+        ]),
     )
 
 

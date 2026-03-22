@@ -8,8 +8,9 @@ On Render: reads from environment variables (ACCOUNTS_JSON, YT_TOKEN_*).
 import os
 import json
 import logging
+from datetime import datetime, timezone
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
@@ -18,6 +19,14 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
 ACCOUNTS_FILE = "accounts.json"
 TOKENS_DIR = "tokens"
+
+# ── In-memory creds cache (survives until process restart) ────────────────────
+# Populated after re-auth so the bot works immediately without env var updates.
+_live_creds: dict[str, Credentials] = {}
+
+# ── Pending OAuth flows keyed by nickname ─────────────────────────────────────
+# Stored between /oauth/start (URL generation) and /oauth/callback (code exchange).
+_pending_flows: dict[str, object] = {}
 
 
 def _is_render() -> bool:
@@ -156,31 +165,125 @@ def remove_account(nickname: str) -> bool:
     return True
 
 
+# ── In-memory / re-auth helpers ──────────────────────────────────────────────
+
+def save_creds_in_memory(nickname: str, creds: Credentials):
+    """Store credentials in the live cache so re-auth works immediately."""
+    _live_creds[nickname] = creds
+    logger.info(f"Stored live credentials for '{nickname}' in memory")
+
+
+def mark_authorized(nickname: str):
+    """Record the current UTC time as when this account was last authorized."""
+    accounts = _load_accounts()
+    if nickname in accounts:
+        accounts[nickname]["authorized_at"] = datetime.now(timezone.utc).isoformat()
+        if not _is_render():
+            _save_accounts(accounts)
+        logger.info(f"Marked '{nickname}' as authorized at {accounts[nickname]['authorized_at']}")
+
+
+def get_oauth_url(nickname: str, redirect_uri: str, client_secret_file: str = "client_secret.json") -> str:
+    """
+    Generate a Google OAuth2 authorization URL for the given account nickname.
+    Stores the Flow object in _pending_flows so the callback can exchange the code.
+    Returns the URL string the user should visit.
+    """
+    if not os.path.exists(client_secret_file):
+        raise FileNotFoundError(f"Client secret file not found: {client_secret_file}")
+
+    flow = Flow.from_client_secrets_file(
+        client_secret_file,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    # Use nickname as OAuth state so we can match it on callback
+    auth_url, _state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",   # force refresh_token to be returned
+        state=nickname,
+    )
+    _pending_flows[nickname] = flow
+    logger.info(f"Generated OAuth URL for '{nickname}': {auth_url[:80]}...")
+    return auth_url
+
+
+def exchange_code_for_token(
+    code: str,
+    nickname: str,
+    redirect_uri: str,
+    client_secret_file: str = "client_secret.json",
+) -> Credentials:
+    """
+    Exchange the OAuth authorization code for credentials.
+    Uses the pending Flow stored by get_oauth_url, or creates a new one as fallback.
+    """
+    flow = _pending_flows.pop(nickname, None)
+    if flow is None:
+        # Fallback: recreate flow (may happen if server restarted between start and callback)
+        logger.warning(f"No pending flow for '{nickname}', recreating from client secret")
+        flow = Flow.from_client_secrets_file(
+            client_secret_file,
+            scopes=SCOPES,
+            redirect_uri=redirect_uri,
+            state=nickname,
+        )
+    flow.redirect_uri = redirect_uri
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    logger.info(f"Token exchange successful for '{nickname}'")
+    return creds
+
+
+# ── YouTube service factory ───────────────────────────────────────────────────
+
 def get_youtube_service(nickname: str, client_secret_file: str = "client_secret.json"):
     """
     Get an authenticated YouTube service for a specific account.
-    Refreshes expired tokens automatically.
-    On Render: reads token from YT_TOKEN_<NICKNAME> env var.
+    Priority:
+      1. In-memory cache (_live_creds) — set after a successful in-bot re-auth
+      2. Environment variable YT_TOKEN_<NICKNAME> (Render mode)
+      3. Token file tokens/<nickname>.json (local mode)
+    Refreshes expired access tokens automatically.
+    Raises RuntimeError with a user-friendly message when the refresh token has expired.
     """
     accounts = _load_accounts()
     if nickname not in accounts:
         raise ValueError(f"Account not found: {nickname}")
 
+    # 1. Check in-memory cache first (populated after in-bot re-auth)
+    if nickname in _live_creds:
+        creds = _live_creds[nickname]
+        if creds.valid:
+            return build("youtube", "v3", credentials=creds)
+        # Try refreshing cached creds
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                return build("youtube", "v3", credentials=creds)
+            except Exception:
+                # Cached creds failed — fall through to env var / file
+                del _live_creds[nickname]
+
+    # 2. Load from env var (Render) or file (local)
     if _is_render():
-        # Load token from environment variable
         env_key = f"YT_TOKEN_{nickname.upper()}"
         token_json = os.getenv(env_key)
         if not token_json:
-            raise ValueError(f"Environment variable {env_key} not set on Render")
+            raise ValueError(
+                f"invalid_grant: No token for '{nickname}' found. "
+                f"Please tap 🔁 Re-auth to authorize this account."
+            )
         token_data = json.loads(token_json)
         creds = Credentials.from_authorized_user_info(token_data, SCOPES)
     else:
-        # Load token from file (local mode)
         token_file = accounts[nickname]["token_file"]
         if not os.path.exists(token_file):
             raise FileNotFoundError(f"Token file not found for {nickname}: {token_file}")
         creds = Credentials.from_authorized_user_file(token_file, SCOPES)
 
+    # 3. Refresh if needed
     if not creds.valid:
         if creds.expired and creds.refresh_token:
             logger.info(f"Refreshing token for account: {nickname}")
@@ -188,36 +291,30 @@ def get_youtube_service(nickname: str, client_secret_file: str = "client_secret.
                 creds.refresh(Request())
             except Exception as e:
                 logger.error(f"Failed to refresh token for {nickname}: {e}")
-                if _is_render():
-                    raise RuntimeError(
-                        f"invalid_grant: Token for '{nickname}' has expired or been revoked. "
-                        f"Please re-authorize the account locally, then update the "
-                        f"YT_TOKEN_{nickname.upper()} environment variable on Render."
-                    ) from e
                 raise RuntimeError(
-                    f"Token for '{nickname}' has expired or been revoked. "
-                    f"Please go to Manage Accounts → Remove Account and re-add it."
+                    f"invalid_grant: Token for '{nickname}' has expired or been revoked. "
+                    f"Please tap 🔁 Re-auth in Manage Accounts to re-authorize."
                 ) from e
 
-            # Save refreshed token back to file (only in local mode)
+            # Persist refreshed token (local only)
             if not _is_render():
                 token_file = accounts[nickname]["token_file"]
                 with open(token_file, "w") as tf:
                     tf.write(creds.to_json())
             else:
-                # On Render, tokens are env vars — log the new token so it can be updated
-                new_token_json = creds.to_json()
                 logger.warning(
-                    f"[RENDER] Token for '{nickname}' was refreshed in-memory. "
-                    f"If the service restarts, it will need re-auth. "
-                    f"New token (update YT_TOKEN_{nickname.upper()} on Render): {new_token_json}"
+                    f"[RENDER] Token for '{nickname}' refreshed in-memory. "
+                    f"Update YT_TOKEN_{nickname.upper()} on Render after next re-auth "
+                    f"to avoid needing re-auth on restart."
                 )
         else:
             raise RuntimeError(
-                f"Token for '{nickname}' is invalid and can't be refreshed. "
-                f"Please remove and re-add the account."
+                f"invalid_grant: Token for '{nickname}' is invalid. "
+                f"Please tap 🔁 Re-auth in Manage Accounts."
             )
 
+    # Cache refreshed creds for next call
+    _live_creds[nickname] = creds
     return build("youtube", "v3", credentials=creds)
 
 
