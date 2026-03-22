@@ -120,12 +120,20 @@ async def handle_oauth_callback(request: web.Request) -> web.Response:
         # Update 'authorized_at' timestamp
         account_manager.mark_authorized(nickname)
 
+        # Persist token: log it and send to user so they can update env var
+        token_json_str = creds.to_json()
+        env_key = f"YT_TOKEN_{nickname.upper()}"
+        logger.info(
+            f"[REAUTH-TOKEN] '{nickname}' new token (copy this entire JSON "
+            f"to Render env var {env_key}):\n{token_json_str}"
+        )
+
         logger.info(f"OAuth callback success for '{nickname}'")
 
         # Notify user via Telegram
         accounts = account_manager.list_accounts()
         label = accounts.get(nickname, {}).get("label", nickname)
-        await _send_reauth_success(nickname, label)
+        await _send_reauth_success(nickname, label, token_json_str, env_key)
 
         return web.Response(
             content_type="text/html",
@@ -149,8 +157,8 @@ async def handle_oauth_callback(request: web.Request) -> web.Response:
         )
 
 
-async def _send_reauth_success(nickname: str, label: str):
-    """Send a Telegram confirmation message after successful re-auth."""
+async def _send_reauth_success(nickname: str, label: str, token_json_str: str = "", env_key: str = ""):
+    """Send a Telegram confirmation message + token JSON after successful re-auth."""
     if _ptb_app is None:
         return
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -166,6 +174,20 @@ async def _send_reauth_success(nickname: str, label: str):
                 parse_mode="Markdown",
                 reply_markup=markup,
             )
+            # Send the new token JSON so user can update Render env var
+            if token_json_str and env_key:
+                await _ptb_app.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        f"🔑 *Update Render env var to persist this token:*\n\n"
+                        f"*Variable:* `{env_key}`\n\n"
+                        f"*Value (copy all):*\n"
+                        f"```\n{token_json_str}\n```\n\n"
+                        f"_Go to Render → Environment → update {env_key} with the JSON above. "
+                        f"Without this, the token is lost on next server restart._"
+                    ),
+                    parse_mode="Markdown",
+                )
         except Exception as exc:
             logger.warning(f"Could not notify user {uid} of reauth success: {exc}")
 
