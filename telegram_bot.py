@@ -522,12 +522,8 @@ async def _show_accounts_menu(query):
         if not is_render:
             row.append(InlineKeyboardButton(f"❌ Remove {label}", callback_data=f"remove_{nickname}"))
         if not authorized:
-            # Only show Re-auth for accounts that actually need it
+            # Only show Re-auth for accounts that need it — authorized ones get no button
             row.append(InlineKeyboardButton(f"🔁 Re-auth {label}", callback_data=f"reauth_{nickname}"))
-        else:
-            # Show a "Re-auth anyway" option as a secondary button if on Render
-            if is_render:
-                row.append(InlineKeyboardButton(f"🔄 Refresh {label}", callback_data=f"reauth_{nickname}"))
         if row:
             buttons.append(row)
 
