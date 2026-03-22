@@ -17,6 +17,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
+import aiohttp
 from aiohttp import web
 
 import account_manager
@@ -120,20 +121,17 @@ async def handle_oauth_callback(request: web.Request) -> web.Response:
         # Update 'authorized_at' timestamp
         account_manager.mark_authorized(nickname)
 
-        # Persist token: log it and send to user so they can update env var
+        # Auto-persist token to Render env var via API
         token_json_str = creds.to_json()
         env_key = f"YT_TOKEN_{nickname.upper()}"
-        logger.info(
-            f"[REAUTH-TOKEN] '{nickname}' new token (copy this entire JSON "
-            f"to Render env var {env_key}):\n{token_json_str}"
-        )
+        render_saved = await _update_render_env_var(env_key, token_json_str)
 
-        logger.info(f"OAuth callback success for '{nickname}'")
+        logger.info(f"OAuth callback success for '{nickname}' (render_saved={render_saved})")
 
         # Notify user via Telegram
         accounts = account_manager.list_accounts()
         label = accounts.get(nickname, {}).get("label", nickname)
-        await _send_reauth_success(nickname, label, token_json_str, env_key)
+        await _send_reauth_success(nickname, label, render_saved)
 
         return web.Response(
             content_type="text/html",
@@ -157,8 +155,67 @@ async def handle_oauth_callback(request: web.Request) -> web.Response:
         )
 
 
-async def _send_reauth_success(nickname: str, label: str, token_json_str: str = "", env_key: str = ""):
-    """Send a Telegram confirmation message + token JSON after successful re-auth."""
+async def _update_render_env_var(key: str, value: str) -> bool:
+    """
+    Update a single env var on Render via the API.
+    Reads ALL current env vars, replaces/adds the target key, PUTs them all back.
+    Returns True on success, False if API key/service ID are missing or API call fails.
+    """
+    api_key = os.getenv("RENDER_API_KEY", "")
+    service_id = os.getenv("RENDER_SERVICE_ID", "")
+    if not api_key or not service_id:
+        logger.warning(
+            f"Cannot auto-update env var '{key}': RENDER_API_KEY or RENDER_SERVICE_ID not set"
+        )
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    base_url = f"https://api.render.com/v1/services/{service_id}/env-vars"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # GET current env vars
+            async with session.get(base_url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.error(f"Render GET env-vars failed: {resp.status}")
+                    return False
+                current = await resp.json()
+
+            # Build updated list: replace target key or add it
+            env_vars = []
+            found = False
+            for ev in current:
+                e = ev.get("envVar", ev)
+                k = e.get("key", "")
+                v = e.get("value", "")
+                if k == key:
+                    env_vars.append({"key": k, "value": value})
+                    found = True
+                else:
+                    env_vars.append({"key": k, "value": v})
+            if not found:
+                env_vars.append({"key": key, "value": value})
+
+            # PUT all env vars back
+            async with session.put(base_url, headers=headers, json=env_vars) as resp:
+                if resp.status == 200:
+                    logger.info(f"✅ Auto-updated Render env var '{key}'")
+                    return True
+                else:
+                    body = await resp.text()
+                    logger.error(f"Render PUT env-vars failed: {resp.status} — {body[:200]}")
+                    return False
+    except Exception as exc:
+        logger.error(f"Render API error updating '{key}': {exc}")
+        return False
+
+
+async def _send_reauth_success(nickname: str, label: str, render_saved: bool = False):
+    """Send a Telegram confirmation message after successful re-auth."""
     if _ptb_app is None:
         return
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -166,28 +223,25 @@ async def _send_reauth_success(nickname: str, label: str, token_json_str: str = 
         [InlineKeyboardButton("📊 Check Status", callback_data=f"status_{nickname}")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")],
     ])
+    if render_saved:
+        save_note = "\n\n💾 Token auto\-saved to Render — survives restarts\."
+    else:
+        save_note = (
+            "\n\n⚠️ Token saved in memory only\. "
+            "Set `RENDER_API_KEY` and `RENDER_SERVICE_ID` env vars on Render "
+            "to enable auto\-save\."
+        )
     for uid in _authorized_user_ids:
         try:
             await _ptb_app.bot.send_message(
                 chat_id=uid,
-                text=f"✅ *{label}* re-authorized successfully!\n\nThe bot can now use this account.",
-                parse_mode="Markdown",
+                text=(
+                    f"✅ *{label}* re\-authorized successfully\!"
+                    f"{save_note}"
+                ),
+                parse_mode="MarkdownV2",
                 reply_markup=markup,
             )
-            # Send the new token JSON so user can update Render env var
-            if token_json_str and env_key:
-                await _ptb_app.bot.send_message(
-                    chat_id=uid,
-                    text=(
-                        f"🔑 *Update Render env var to persist this token:*\n\n"
-                        f"*Variable:* `{env_key}`\n\n"
-                        f"*Value (copy all):*\n"
-                        f"```\n{token_json_str}\n```\n\n"
-                        f"_Go to Render → Environment → update {env_key} with the JSON above. "
-                        f"Without this, the token is lost on next server restart._"
-                    ),
-                    parse_mode="Markdown",
-                )
         except Exception as exc:
             logger.warning(f"Could not notify user {uid} of reauth success: {exc}")
 
