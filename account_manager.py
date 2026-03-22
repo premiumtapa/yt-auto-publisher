@@ -184,7 +184,14 @@ def get_youtube_service(nickname: str, client_secret_file: str = "client_secret.
     if not creds.valid:
         if creds.expired and creds.refresh_token:
             logger.info(f"Refreshing token for account: {nickname}")
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                logger.error(f"Failed to refresh token for {nickname}: {e}")
+                raise RuntimeError(
+                    f"Token for '{nickname}' has expired or been revoked. "
+                    f"Please go to Accounts -> Remove Account and re-add it."
+                ) from e
             # Save refreshed token back to file (only in local mode)
             if not _is_render():
                 token_file = accounts[nickname]["token_file"]

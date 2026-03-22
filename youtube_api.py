@@ -35,7 +35,11 @@ def authenticate(client_secret_file: str = "client_secret.json", token_file: str
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             logger.info("Refreshing expired YouTube credentials...")
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                logger.error(f"Failed to refresh YouTube credentials: {e}")
+                raise RuntimeError("YouTube token has expired or been revoked. Please authenticate again.") from e
         else:
             if not os.path.exists(client_secret_file):
                 raise FileNotFoundError(

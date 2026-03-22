@@ -52,6 +52,16 @@ def is_authorized(update: Update) -> bool:
     return user is not None and user.id in AUTHORIZED_USER_IDS
 
 
+def format_error(e: Exception) -> str:
+    """Format an exception into a user-friendly string."""
+    err_str = str(e)
+    if "invalid_grant" in err_str or "Token has been expired or revoked" in err_str:
+        return "⚠️ *Token Expired/Revoked*\nPlease go to 👤 Manage Accounts -> \U0001f5d1\ufe0f Remove Account and re-add it."
+    if "quotaExceeded" in err_str:
+        return "⚠️ *YouTube API Quota Exceeded*\nYou must wait until midnight Pacific Time to publish more."
+    return f"`{err_str[:300]}`"
+
+
 # ──────────────────────────────────────────────
 # Main Menu
 # ──────────────────────────────────────────────
@@ -188,8 +198,8 @@ async def _publish_account(query, nickname: str):
     )
 
     try:
-        youtube = account_manager.get_youtube_service(nickname, CLIENT_SECRET_FILE)
-        private_videos = youtube_api.get_private_videos(youtube)
+        youtube = await asyncio.to_thread(account_manager.get_youtube_service, nickname, CLIENT_SECRET_FILE)
+        private_videos = await asyncio.to_thread(youtube_api.get_private_videos, youtube)
 
         if not private_videos:
             await query.edit_message_text(
@@ -224,25 +234,28 @@ async def _publish_account(query, nickname: str):
                 )
 
                 # Step 1: Find trending videos in this niche for context
-                trending = youtube_api.get_trending_videos(
-                    youtube, original_title, max_results=5
+                trending = await asyncio.to_thread(
+                    youtube_api.get_trending_videos, youtube, original_title, max_results=5
                 )
 
                 # Step 2: Generate AI metadata with trend context
-                optimized = gemini_ai.optimize_video_metadata(
-                    original_title, trending_videos=trending
+                optimized = await asyncio.to_thread(
+                    gemini_ai.optimize_video_metadata, original_title, trending_videos=trending
                 )
                 new_title = optimized["title"]
                 new_description = optimized["description"]
                 new_tags = optimized["tags"]
 
                 # Update metadata
-                youtube_api.update_video_metadata(
+                await asyncio.to_thread(
+                    youtube_api.update_video_metadata,
                     youtube, video_id, new_title, new_description, new_tags, category_id,
                 )
 
                 # Set public
-                youtube_api.set_video_public(youtube, video_id)
+                await asyncio.to_thread(
+                    youtube_api.set_video_public, youtube, video_id
+                )
 
                 # Report success
                 video_url = f"https://youtu.be/{video_id}"
@@ -275,7 +288,7 @@ async def _publish_account(query, nickname: str):
                 logger.error(f"Error processing video {video_id}: {e}", exc_info=True)
                 await query.message.reply_text(
                     f"❌ *Error processing:* `{original_title}`\n"
-                    f"Error: `{str(e)[:200]}`",
+                    f"{format_error(e)}",
                     parse_mode="Markdown",
                 )
 
@@ -290,7 +303,7 @@ async def _publish_account(query, nickname: str):
     except Exception as e:
         logger.error(f"Error publishing from {nickname}: {e}", exc_info=True)
         await query.edit_message_text(
-            f"❌ *Error:*\n`{str(e)[:300]}`",
+            f"❌ *Error:*\n{format_error(e)}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")],
@@ -311,8 +324,8 @@ async def _publish_all(query):
     for nickname in accounts:
         try:
             label = accounts[nickname].get("label", nickname)
-            youtube = account_manager.get_youtube_service(nickname, CLIENT_SECRET_FILE)
-            private_videos = youtube_api.get_private_videos(youtube)
+            youtube = await asyncio.to_thread(account_manager.get_youtube_service, nickname, CLIENT_SECRET_FILE)
+            private_videos = await asyncio.to_thread(youtube_api.get_private_videos, youtube)
 
             if not private_videos:
                 await query.message.reply_text(f"📭 {label}: No private videos found.")
@@ -326,20 +339,24 @@ async def _publish_all(query):
             for video in private_videos:
                 try:
                     # Step 1: Find trending videos in this niche for context
-                    trending = youtube_api.get_trending_videos(
-                        youtube, video["title"], max_results=5
+                    trending = await asyncio.to_thread(
+                        youtube_api.get_trending_videos, youtube, video["title"], max_results=5
                     )
 
                     # Step 2: Generate AI metadata with trend context
-                    optimized = gemini_ai.optimize_video_metadata(
+                    optimized = await asyncio.to_thread(
+                        youtube_api.generate_ai_metadata,
                         video["title"], trending_videos=trending
                     )
-                    youtube_api.update_video_metadata(
+                    await asyncio.to_thread(
+                        youtube_api.update_video_metadata,
                         youtube, video["video_id"],
                         optimized["title"], optimized["description"],
                         optimized["tags"], video["categoryId"],
                     )
-                    youtube_api.set_video_public(youtube, video["video_id"])
+                    await asyncio.to_thread(
+                        youtube_api.set_video_public, youtube, video["video_id"]
+                    )
 
                     video_url = f"https://youtu.be/{video['video_id']}"
                     trend_note = (
@@ -354,14 +371,14 @@ async def _publish_all(query):
                 except Exception as e:
                     logger.error(f"Error: {e}", exc_info=True)
                     await query.message.reply_text(
-                        f"❌ Error on {label}: `{str(e)[:200]}`",
+                        f"❌ Error on {label}:\n{format_error(e)}",
                         parse_mode="Markdown",
                     )
 
         except Exception as e:
             logger.error(f"Error with account {nickname}: {e}", exc_info=True)
             await query.message.reply_text(
-                f"❌ Error with {nickname}: `{str(e)[:200]}`",
+                f"❌ Error with {nickname}:\n{format_error(e)}",
                 parse_mode="Markdown",
             )
 
@@ -415,10 +432,11 @@ async def _status_account(query, nickname: str):
     label = info.get("label", nickname)
 
     try:
-        youtube = account_manager.get_youtube_service(nickname, CLIENT_SECRET_FILE)
+        youtube = await asyncio.to_thread(account_manager.get_youtube_service, nickname, CLIENT_SECRET_FILE)
 
         # Get channel stats
-        channels = youtube.channels().list(part="statistics,snippet", mine=True).execute()
+        request = youtube.channels().list(part="statistics,snippet", mine=True)
+        channels = await asyncio.to_thread(request.execute)
         if not channels.get("items"):
             await query.edit_message_text(f"❌ Could not fetch stats for {label}")
             return
@@ -428,7 +446,7 @@ async def _status_account(query, nickname: str):
         name = ch["snippet"]["title"]
 
         # Count private videos
-        private_videos = youtube_api.get_private_videos(youtube)
+        private_videos = await asyncio.to_thread(youtube_api.get_private_videos, youtube)
 
         await query.edit_message_text(
             f"📊 *Channel: {name}*\n\n"
@@ -447,7 +465,7 @@ async def _status_account(query, nickname: str):
     except Exception as e:
         logger.error(f"Error getting status for {nickname}: {e}", exc_info=True)
         await query.edit_message_text(
-            f"❌ *Error checking {label}:*\n`{str(e)[:300]}`",
+            f"❌ *Error checking {label}:*\n{format_error(e)}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")],
@@ -691,7 +709,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
             await update.message.reply_text(
-                f"❌ *Error during authorization:*\n`{str(e)[:300]}`",
+                f"❌ *Error during authorization:*\n{format_error(e)}",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")],
@@ -749,7 +767,7 @@ async def _save_picked_channel(query, channel_id: str, context: ContextTypes.DEF
     except Exception as e:
         logger.error(f"Error saving picked channel: {e}", exc_info=True)
         await query.edit_message_text(
-            f"❌ *Error saving channel:*\n`{str(e)[:300]}`",
+            f"❌ *Error saving channel:*\n{format_error(e)}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu_main")],
@@ -831,8 +849,8 @@ async def cmd_publish_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            youtube = account_manager.get_youtube_service(nickname, CLIENT_SECRET_FILE)
-            private_videos = youtube_api.get_private_videos(youtube)
+            youtube = await asyncio.to_thread(account_manager.get_youtube_service, nickname, CLIENT_SECRET_FILE)
+            private_videos = await asyncio.to_thread(youtube_api.get_private_videos, youtube)
 
             if not private_videos:
                 await update.message.reply_text(
@@ -854,22 +872,25 @@ async def cmd_publish_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="Markdown",
                     )
                     # Step 1: Find trending videos in this niche for context
-                    trending = youtube_api.get_trending_videos(
-                        youtube, video["title"], max_results=5
+                    trending = await asyncio.to_thread(
+                        youtube_api.get_trending_videos, youtube, video["title"], max_results=5
                     )
 
                     # Step 2: Generate AI metadata with trend context
-                    optimized = gemini_ai.optimize_video_metadata(
-                        video["title"], trending_videos=trending
+                    optimized = await asyncio.to_thread(
+                        gemini_ai.optimize_video_metadata, video["title"], trending_videos=trending
                     )
 
                     # Step 3: Apply metadata and publish
-                    youtube_api.update_video_metadata(
+                    await asyncio.to_thread(
+                        youtube_api.update_video_metadata,
                         youtube, video["video_id"],
                         optimized["title"], optimized["description"],
                         optimized["tags"], video["categoryId"],
                     )
-                    youtube_api.set_video_public(youtube, video["video_id"])
+                    await asyncio.to_thread(
+                        youtube_api.set_video_public, youtube, video["video_id"]
+                    )
 
                     video_url = f"https://youtu.be/{video['video_id']}"
                     tags_str = ", ".join(optimized["tags"][:8])
@@ -888,13 +909,13 @@ async def cmd_publish_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as e:
                     logger.error(f"Error: {e}", exc_info=True)
-                    await update.message.reply_text(f"❌ Error: `{str(e)[:200]}`", parse_mode="Markdown")
+                    await update.message.reply_text(f"❌ Error:\n{format_error(e)}", parse_mode="Markdown")
 
             await update.message.reply_text(f"🎉 Done! Processed {len(private_videos)} video(s).")
 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
-            await update.message.reply_text(f"❌ Error: `{str(e)[:300]}`", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ Error:\n{format_error(e)}", parse_mode="Markdown")
     else:
         # Multiple accounts — show picker
         buttons = [
