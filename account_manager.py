@@ -24,6 +24,10 @@ TOKENS_DIR = "tokens"
 # Populated after re-auth so the bot works immediately without env var updates.
 _live_creds: dict[str, Credentials] = {}
 
+# ── In-memory authorized_at overrides (Render only) ──────────────────────────
+# Updated by mark_authorized so the token monitor sees fresh timestamps.
+_authorized_at_overrides: dict[str, str] = {}
+
 # ── Pending OAuth flows keyed by nickname ─────────────────────────────────────
 # Stored between /oauth/start (URL generation) and /oauth/callback (code exchange).
 _pending_flows: dict[str, object] = {}
@@ -40,10 +44,15 @@ def _load_accounts() -> dict:
         raw = os.getenv("ACCOUNTS_JSON", "{}")
         try:
             data = json.loads(raw)
-            return data.get("accounts", {})
+            accounts = data.get("accounts", {})
         except json.JSONDecodeError:
             logger.error("ACCOUNTS_JSON env var contains invalid JSON")
             return {}
+        # Merge in-memory authorized_at overrides so token monitor sees fresh timestamps
+        for nick, ts in _authorized_at_overrides.items():
+            if nick in accounts:
+                accounts[nick]["authorized_at"] = ts
+        return accounts
     if not os.path.exists(ACCOUNTS_FILE):
         return {}
     with open(ACCOUNTS_FILE, "r") as f:
@@ -175,12 +184,55 @@ def save_creds_in_memory(nickname: str, creds: Credentials):
 
 def mark_authorized(nickname: str):
     """Record the current UTC time as when this account was last authorized."""
+    now_iso = datetime.now(timezone.utc).isoformat()
     accounts = _load_accounts()
     if nickname in accounts:
-        accounts[nickname]["authorized_at"] = datetime.now(timezone.utc).isoformat()
+        accounts[nickname]["authorized_at"] = now_iso
+        # In-memory override so token monitor sees it without env var reload
+        _authorized_at_overrides[nickname] = now_iso
         if not _is_render():
             _save_accounts(accounts)
-        logger.info(f"Marked '{nickname}' as authorized at {accounts[nickname]['authorized_at']}")
+        else:
+            # Also persist to ACCOUNTS_JSON env var on Render via API
+            _update_accounts_json_on_render(accounts)
+        logger.info(f"Marked '{nickname}' as authorized at {now_iso}")
+
+
+def _update_accounts_json_on_render(accounts: dict):
+    """Best-effort update of ACCOUNTS_JSON env var on Render via API."""
+    try:
+        import requests
+        api_key = os.getenv("RENDER_API_KEY", "")
+        service_id = os.getenv("RENDER_SERVICE_ID", "")
+        if not api_key or not service_id:
+            return
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        base_url = f"https://api.render.com/v1/services/{service_id}/env-vars"
+        # GET current env vars
+        r = requests.get(base_url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return
+        current = r.json()
+        # Build updated JSON
+        new_accounts_json = json.dumps({"accounts": accounts})
+        env_vars = []
+        for ev in current:
+            e = ev.get("envVar", ev)
+            k = e.get("key", "")
+            v = e.get("value", "")
+            if k == "ACCOUNTS_JSON":
+                env_vars.append({"key": k, "value": new_accounts_json})
+            else:
+                env_vars.append({"key": k, "value": v})
+        # PUT all env vars back
+        requests.put(base_url, headers=headers, json=env_vars, timeout=10)
+        logger.info(f"Updated ACCOUNTS_JSON on Render with new authorized_at timestamps")
+    except Exception as exc:
+        logger.warning(f"Could not update ACCOUNTS_JSON on Render: {exc}")
 
 
 def get_oauth_url(nickname: str, redirect_uri: str, client_secret_file: str = "client_secret.json") -> str:
